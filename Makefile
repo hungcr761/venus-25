@@ -1,0 +1,139 @@
+ROOT := $(CURDIR)
+
+CARGO_ZISK_BIN := $(ROOT)/target/release/cargo-zisk
+BUILD_DIR := $(ROOT)/build
+PROVING_KEY := $(BUILD_DIR)/provingKey
+FIXED_DIR := $(ROOT)/tmp/fixed
+PROOF_DIR := $(ROOT)/tmp
+PROOF_FILE := $(PROOF_DIR)/vadcop_final_proof.bin
+
+GUEST_DIR := $(ROOT)/guest/zisk-eth-client/bin/guests/stateless-validator-reth
+GUEST_NAME := zec-reth
+ELF := $(GUEST_DIR)/target/riscv64ima-zisk-zkvm-elf/release/$(GUEST_NAME)
+NATIVE_GUEST := $(GUEST_DIR)/target/release/$(GUEST_NAME)
+INPUT ?= $(GUEST_DIR)/inputs/mainnet_24628607_66_7_zec_reth.bin
+
+USE_HINTS ?= false
+INPUT_STEM := $(basename $(notdir $(INPUT)))
+INPUT_BLOCK := $(word 2,$(subst _, ,$(INPUT_STEM)))
+HINTS_DIR := $(GUEST_DIR)/hints
+HINTS_FILE ?= $(HINTS_DIR)/$(INPUT_BLOCK)_hints.bin
+
+NODE := node --max-old-space-size=16384
+SETUP_NODE := node --max-old-space-size=16384 --stack-size=8192
+
+ifeq ($(USE_HINTS),true)
+ROM_SETUP_HINTS := -n
+PROVE_ARGS := -H $(HINTS_FILE)
+PROVE_PREPARE := generate-hints
+else
+ROM_SETUP_HINTS :=
+PROVE_ARGS := -i $(INPUT)
+PROVE_PREPARE :=
+endif
+PROVE_GPU_ARGS ?= -t 2 -h 4
+CARGO_BUILD_RUSTFLAGS ?= -C target-cpu=native
+PROVE_ENV ?= CUDA_MODULE_LOADING=EAGER CUDA_DEVICE_MAX_CONNECTIONS=32 RAYON_NUM_THREADS=32 VENUS_ROWMAJOR_REG=1 VENUS_ROWMAJOR_TPB=256 VENUS_WEIGHTED_PROOF_ORDER=1 VENUS_COMPRESSOR_FIRST_ORDER=1 VENUS_BASIC_PRELOAD_AIR_ID=12 VENUS_EXPR_MAX_BLOCKS=288 VENUS_WEIGHT_Q_OPS=14 VENUS_REGISTER_WITNESS_H2D=1 VENUS_DIRECT_REGISTERED_H2D=1 VENUS_PINNED_CHUNK_MB=256 VENUS_Q4152_REG=1 VENUS_REUSE_CUSTOM_FIXED=1 VENUS_RECURSIVE_WITNESS_WORKERS=24 VENUS_CONTRIBUTION_WORKERS=8 VENUS_SKIP_NATIVE_RECURSIVE_VERIFY=1
+
+.PHONY: all setup build install-toolchain check-key generate-key generate-key-rs generate-key-js build-guest build-guest-native \
+        generate-hints rom-setup compile-key prove verify clean purge help
+
+all: setup prove verify
+
+setup: build install-toolchain check-key build-guest rom-setup compile-key
+
+build:
+	RUSTFLAGS="$(CARGO_BUILD_RUSTFLAGS)" cargo build --release --features gpu -p cargo-zisk --bin cargo-zisk
+
+install-toolchain: build
+	@if rustup toolchain list | grep -q '^zisk'; then \
+		echo "zisk toolchain already installed"; \
+	else \
+		"$(CARGO_ZISK_BIN)" sdk install-toolchain; \
+	fi
+
+check-key:
+	@if [ ! -d "$(PROVING_KEY)" ]; then \
+		echo "proving key not found at $(PROVING_KEY), generating..."; \
+		$(MAKE) generate-key-rs; \
+	fi
+
+generate-key:
+	$(MAKE) generate-key-rs
+
+generate-key-js:
+	mkdir -p "$(BUILD_DIR)" "$(FIXED_DIR)" "$(PROOF_DIR)"
+	rm -rf "$(PROVING_KEY)"
+	npm install --prefix "$(ROOT)/pil2-compiler"
+	npm install --prefix "$(ROOT)/pil2-proofman-js"
+	cargo run --release --bin arith_frops_fixed_gen
+	cargo run --release --bin binary_basic_frops_fixed_gen
+	cargo run --release --bin binary_extension_frops_fixed_gen
+	$(NODE) "$(ROOT)/pil2-compiler/src/pil.js" "$(ROOT)/pil/zisk.pil" \
+		-I "$(ROOT)/pil,$(ROOT)/pil2-proofman/pil2-components/lib/std/pil,$(ROOT)/state-machines,$(ROOT)/precompiles" \
+		-o "$(ROOT)/pil/zisk.pilout" -u "$(FIXED_DIR)" -O fixed-to-file
+	$(SETUP_NODE) "$(ROOT)/pil2-proofman-js/src/main_setup.js" \
+		-a "$(ROOT)/pil/zisk.pilout" -b "$(BUILD_DIR)" \
+		-t "$(ROOT)/pil2-proofman/pil2-components/lib/std/pil" \
+		-u "$(FIXED_DIR)" -r -s "$(ROOT)/state-machines/starkstructs.json"
+
+generate-key-rs:
+	cargo run --release -p pk-setup-rs --bin generate-key-rs -- \
+		--root "$(ROOT)" --build-dir "$(BUILD_DIR)" \
+		--fixed-dir "$(FIXED_DIR)" --proof-dir "$(PROOF_DIR)" \
+		--airout "$(ROOT)/pil/zisk.pilout" \
+		--starkstructs "$(ROOT)/state-machines/starkstructs.json" -r
+
+build-guest: install-toolchain
+	cd "$(GUEST_DIR)" && "$(CARGO_ZISK_BIN)" build --release
+
+build-guest-native:
+	mkdir -p "$(GUEST_DIR)/build"
+	cd "$(GUEST_DIR)" && RUSTFLAGS='--cfg zisk_hints' cargo build --release
+
+generate-hints: build-guest-native
+	mkdir -p "$(GUEST_DIR)/build" "$(HINTS_DIR)"
+	rm -f "$(HINTS_FILE)"
+	cp "$(INPUT)" "$(GUEST_DIR)/build/input.bin"
+	cd "$(GUEST_DIR)" && "./target/release/$(GUEST_NAME)"
+	test -f "$(HINTS_FILE)"
+
+rom-setup: build-guest check-key
+	"$(CARGO_ZISK_BIN)" rom-setup -e "$(ELF)" -k "$(PROVING_KEY)" $(ROM_SETUP_HINTS)
+
+compile-key: rom-setup
+	"$(CARGO_ZISK_BIN)" check-setup -k "$(PROVING_KEY)"
+	"$(CARGO_ZISK_BIN)" check-setup -k "$(PROVING_KEY)" -a
+
+prove: check-key $(PROVE_PREPARE)
+	@if [ ! -f "$(ELF)" ]; then \
+		echo "guest ELF not found at $(ELF), run make setup first"; \
+		exit 1; \
+	fi
+	$(PROVE_ENV) "$(CARGO_ZISK_BIN)" prove -e "$(ELF)" $(PROVE_ARGS) -k "$(PROVING_KEY)" -o "$(PROOF_DIR)" -a -y $(PROVE_GPU_ARGS)
+
+verify: check-key
+	@if [ ! -f "$(PROOF_FILE)" ]; then \
+		echo "proof file not found at $(PROOF_FILE), run make prove first"; \
+		exit 1; \
+	fi
+	"$(CARGO_ZISK_BIN)" verify -p "$(PROOF_FILE)" -k "$(PROVING_KEY)"
+
+clean:
+	rm -rf "$(ROOT)/target" "$(ROOT)/tmp" "$(GUEST_DIR)/target" "$(GUEST_DIR)/build" "$(GUEST_DIR)/hints"
+
+purge: clean
+	rm -rf "$(BUILD_DIR)" "$(ROOT)/pil/zisk.pilout" "$(ROOT)/pil2-compiler/node_modules" "$(ROOT)/pil2-proofman-js/node_modules"
+
+help:
+	@echo "Targets:"
+	@echo "  make setup"
+	@echo "  make generate-key"
+	@echo "  make generate-key-rs"
+	@echo "  make generate-key-js"
+	@echo "  make prove"
+	@echo "  make verify"
+	@echo ""
+	@echo "Variables:"
+	@echo "  INPUT=/abs/path/to/input.bin"
+	@echo "  USE_HINTS=true"
