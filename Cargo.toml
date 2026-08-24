@@ -50,7 +50,6 @@ members = [
     "sdk",
     "ziskbuild",
 	"definitions",
-    "pk-setup-rs",
 ]
 
 resolver = "2"
